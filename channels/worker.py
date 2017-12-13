@@ -7,6 +7,7 @@ import signal
 import sys
 import threading
 import time
+from functools import partial
 
 from .exceptions import ChannelSocketException, ConsumeLater, DenyConnection
 from .message import Message
@@ -168,28 +169,52 @@ class WorkerGroup(Worker):
     terminating them if a signal is received.
     """
 
-    def __init__(self, *args, **kwargs):
-        n_threads = kwargs.pop('n_threads', multiprocessing.cpu_count()) - 1
+    def __init__(self, channel_layer, *args, **kwargs):
+        self.channel_layer = channel_layer
+        self.only_channels = kwargs.get('only_channels')
+        self.exclude_channels = kwargs.get('exclude_channels')
+        self.signal_handlers = kwargs.pop('signal_handlers', True)
         self.stop_gracefully = kwargs.pop('stop_gracefully', False)
-        super(WorkerGroup, self).__init__(*args, **kwargs)
+        n_threads = kwargs.pop('n_threads', multiprocessing.cpu_count())
+        self.stop_requested = threading.Event()
         kwargs['signal_handlers'] = False
-        self.workers = [Worker(*args, **kwargs) for ii in range(n_threads)]
+        self.workers = [Worker(channel_layer, *args, **kwargs)
+                        for ii in range(n_threads)]
 
     def sigterm_handler(self, signo, stack_frame):
-        self.termed = True
         for worker in self.workers:
             worker.termed = True
         msg_prefix = "Shutdown signal received by WorkerGroup, "
         if self.stop_gracefully:
+            self.cancel_rabbitmq_consumers()
             logger.info(msg_prefix + "waiting for sub-workers.")
-            if not self.in_job:
-                raise StopWorkerGroupLoop()
+            self.stop_requested.set()
         else:
             logger.info(msg_prefix + "terminating immediately.")
             sys.exit(0)
 
+    def cancel_rabbitmq_consumers(self):
+        """Helper to cancel all current RabbitMQ consumers."""
+
+        def cancel_ok(event, frame):
+            """Consumer cancel acknoledgement callback."""
+            event.set()
+
+        logger.info('Cancelling current RabbitMQ consumers.')
+        rmq_connection = self.channel_layer._thread.connection.connection
+        cancel_events = []  # keep events to wait for them later
+        for channel in rmq_connection._channels.values():
+            for tag in list(channel._consumers):
+                cancel_event = threading.Event()
+                cancel_events.append(cancel_event)
+                callback = partial(cancel_ok, cancel_event)
+                channel.basic_cancel(callback, consumer_tag=tag)
+        # wait for cancel acknowledgements for all consumers
+        while any(not event.is_set() for event in cancel_events):
+            time.sleep(0.1)
+        logger.info('Cancelled current RabbitMQ consumers.')
+
     def ready(self):
-        super(WorkerGroup, self).ready()
         for wkr in self.workers:
             wkr.ready()
 
@@ -197,19 +222,22 @@ class WorkerGroup(Worker):
         """
         Launch sub-workers before running.
         """
+        if self.signal_handlers:
+            self.install_signal_handler()
         self.threads = [threading.Thread(target=self.workers[ii].run)
                         for ii in range(len(self.workers))]
         for t in self.threads:
             t.daemon = True
             t.start()
-        try:
-            super(WorkerGroup, self).run()
-        except StopWorkerGroupLoop:
-            pass
+        while any(self.threads[worker_id].is_alive()
+                  for worker_id in range(len(self.workers))):
+            if self.stop_requested.wait(5):
+                break
         if self.stop_gracefully:
             self.wait_for_workers()
 
     def wait_for_workers(self):
+        logger.info('Waiting for workers handling last messages.')
         while any(self.threads[worker_id].is_alive() and
                   self.workers[worker_id].in_job
                   for worker_id in range(len(self.workers))):

@@ -186,7 +186,7 @@ class AsgiHandler(base.BaseHandler):
         Async entrypoint - uses the sync_to_async wrapper to run things in a
         threadpool.
         """
-        self.send = async_to_sync(send)
+        self.send = send
         body = b""
         while True:
             message = await receive()
@@ -202,18 +202,27 @@ class AsgiHandler(base.BaseHandler):
                     await self.handle(body)
                     return
 
+    async def handle(self, body):
+        response = await self._handle_request(body)
+        if response:
+            if not getattr(response, 'asynchronous', False):
+                self.send = async_to_sync(self.send)
+                handler = self._handle_response_sync
+            else:
+                handler = self._handle_response_async
+            await handler(response)
+            # Close the response now we're done with it
+            await sync_to_async(response.close)()
+
     @sync_to_async
-    def handle(self, body):
-        """
-        Synchronous message processing.
-        """
+    def _handle_request(self, body):
         # Set script prefix from message root_path, turning None into empty string
         script_prefix = self.scope.get("root_path", "") or ""
         if settings.FORCE_SCRIPT_NAME:
             script_prefix = settings.FORCE_SCRIPT_NAME
         set_script_prefix(script_prefix)
         signals.request_started.send(sender=self.__class__, scope=self.scope)
-        # Run request through view system
+        # Run request through Django view system.
         try:
             request = self.request_class(self.scope, body)
         except UnicodeDecodeError:
@@ -234,11 +243,21 @@ class AsgiHandler(base.BaseHandler):
             # Fix chunk size on file responses
             if isinstance(response, FileResponse):
                 response.block_size = 1024 * 512
+        return response
+
+    @sync_to_async
+    def _handle_response_sync(self, response):
         # Transform response into messages, which we yield back to caller
-        for response_message in self.encode_response(response):
+        self.send(self.encode_response_headers(response))
+        for response_message in self.encode_response_body_sync(response):
             self.send(response_message)
-        # Close the response now we're done with it
-        response.close()
+
+    async def _handle_response_async(self, response):
+        # FIXME it should behave similar to streaming response
+        headers = self.encode_response_headers(response)
+        await self.send(headers)
+        async for response_message in self.encode_response_body_async(response):
+            await self.send(response_message)
 
     def handle_uncaught_exception(self, request, resolver, exc_info):
         """
@@ -293,9 +312,9 @@ class AsgiHandler(base.BaseHandler):
                 self.__class__._response_middleware = self._response_middleware
 
     @classmethod
-    def encode_response(cls, response):
+    def encode_response_headers(cls, response):
         """
-        Encodes a Django HTTP response into ASGI http.response message(s).
+        Encodes a Django HTTP response headers into ASGI http.response message(s).
         """
         # Collect cookies into headers.
         # Note that we have to preserve header case as there are some non-RFC
@@ -312,11 +331,14 @@ class AsgiHandler(base.BaseHandler):
                 (b"Set-Cookie", c.output(header="").encode("ascii").strip())
             )
         # Make initial response message
-        yield {
+        return {
             "type": "http.response.start",
             "status": response.status_code,
             "headers": response_headers,
         }
+
+    @classmethod
+    def encode_response_body_sync(cls, response):
         # Streaming responses need to be pinned to their iterator
         if response.streaming:
             # Access `__iter__` and not `streaming_content` directly in case
@@ -341,6 +363,20 @@ class AsgiHandler(base.BaseHandler):
                     "body": chunk,
                     "more_body": not last,
                 }
+
+    @classmethod
+    async def encode_response_body_async(cls, response):
+        async for part in response:
+            for chunk, _ in cls.chunk_bytes(part):
+                yield {
+                    "type": "http.response.body",
+                    "body": chunk,
+                    # We ignore "more" as there may be more parts; instead,
+                    # we use an empty final closing message with False.
+                    "more_body": True,
+                }
+            # Final closing message
+        yield {"type": "http.response.body"}
 
     @classmethod
     def chunk_bytes(cls, data):
